@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use tokio::process::Command;
 const ADDR_127: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[derive(Clone, Debug)]
@@ -87,16 +88,33 @@ enum LoopFailure {
     Listener,
 }
 
+async fn get_wg_ip() -> String {
+    let output = Command::new("ifconfig")
+        .arg("wg0-client")
+        .output()
+        .await
+        .expect("Failed to get wg ip");
+
+    let out_string = String::from_utf8_lossy(&output.stdout).to_string();
+    for line in out_string.lines() {
+        if line.contains("inet ") {
+            let ip = line.split("inet ").collect::<Vec<&str>>()[1]
+                .split(" ")
+                .collect::<Vec<&str>>()[0];
+            return ip.to_string();
+        }
+    }
+    return "".into();
+}
+
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(
-        port: i32,
-        serial: i32,
-        key: &str,
-        rmem: usize,
-    ) -> ResultType<()> {
+    pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
-        let addr = format!("0.0.0.0:{}", port);
+        let wg_ip = get_wg_ip().await;
+        let ip = if wg_ip.len() == 0 { "0.0.0.0" } else { &wg_ip };
+        println!("ip: {}", wg_ip);
+        let addr = format!("{}:{}", ip, port);
         let addr2 = format!("0.0.0.0:{}", port - 1);
         let addr3 = format!("0.0.0.0:{}", port + 2);
         let pm = PeerMap::new().await?;
@@ -1044,21 +1062,12 @@ impl RendezvousServer {
         });
     }
 
-    async fn handle_listener(
-        &self,
-        stream: TcpStream,
-        addr: SocketAddr,
-        key: &str,
-        ws: bool,
-    ) {
+    async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
         log::debug!("Tcp connection from {:?}, ws: {}", addr, ws);
         let mut rs = self.clone();
         let key = key.to_owned();
         tokio::spawn(async move {
-            allow_err!(
-                rs.handle_listener_inner(stream, addr, &key, ws)
-                    .await
-            );
+            allow_err!(rs.handle_listener_inner(stream, addr, &key, ws).await);
         });
     }
 
@@ -1078,10 +1087,7 @@ impl RendezvousServer {
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 match msg {
                     tungstenite::Message::Binary(bytes) => {
-                        if !self
-                            .handle_tcp(&bytes, &mut sink, addr, key, ws)
-                            .await
-                        {
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                             break;
                         }
                     }
@@ -1092,10 +1098,7 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self
-                    .handle_tcp(&bytes, &mut sink, addr, key, ws)
-                    .await
-                {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
             }
